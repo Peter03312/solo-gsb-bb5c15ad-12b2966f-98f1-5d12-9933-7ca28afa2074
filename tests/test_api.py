@@ -234,5 +234,422 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(resp.json()["cues"][0]["speaker"], "bob")
 
 
+class ResolveTests(unittest.TestCase):
+    # —— 无冲突：仅允许空决策 ——
+
+    def test_no_conflict_empty_decisions_resolves(self):
+        body = {
+            "base": [cue("a", 0, 2, "hello")],
+            "current": [cue("a", 0, 2, "hello!")],
+            "incoming": [cue("a", 0, 2, "hello")],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "resolved")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["cues"][0]["text"], "hello!")
+
+    def test_no_conflict_empty_lists_resolves(self):
+        resp = client.post(
+            "/resolve",
+            json={
+                "base": [cue("a", 0, 2)],
+                "current": [cue("a", 0, 2)],
+                "incoming": [cue("a", 0, 2)],
+                "field_choices": [],
+                "cue_choices": [],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["status"], "resolved")
+
+    def test_no_conflict_with_field_choice_is_unknown(self):
+        body = {
+            "base": [cue("a", 0, 2)],
+            "current": [cue("a", 0, 2)],
+            "incoming": [cue("a", 0, 2)],
+            "field_choices": [
+                {"cue_id": "a", "field": "text", "choice": "current"}
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "decision_error")
+        self.assertEqual(len(data["errors"]), 1)
+        self.assertEqual(data["errors"][0]["type"], "unknown")
+
+    def test_no_conflict_with_cue_choice_is_unknown(self):
+        body = {
+            "base": [cue("a", 0, 2)],
+            "current": [cue("a", 0, 2)],
+            "incoming": [cue("a", 0, 2)],
+            "cue_choices": [{"cue_id": "a", "choice": "delete"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["errors"][0]["type"], "unknown")
+
+    # —— 字段级冲突 ——
+
+    def test_field_conflict_resolve_pick_side(self):
+        for choice, expected in [
+            ("base", "hi"),
+            ("current", "one"),
+            ("incoming", "two"),
+        ]:
+            with self.subTest(choice=choice):
+                body = {
+                    "base": [cue("a", 0, 2, "hi")],
+                    "current": [cue("a", 0, 2, "one")],
+                    "incoming": [cue("a", 0, 2, "two")],
+                    "field_choices": [
+                        {"cue_id": "a", "field": "text", "choice": choice}
+                    ],
+                }
+                resp = client.post("/resolve", json=body)
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertEqual(resp.json()["cues"][0]["text"], expected)
+
+    def test_field_choice_merges_non_conflicting_fields(self):
+        # current 改文本，incoming 改文本（冲突）与起点；起点单侧改动仍自动采纳
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [cue("a", 0, 2, "one")],
+            "incoming": [cue("a", 1, 2, "two")],
+            "field_choices": [
+                {"cue_id": "a", "field": "text", "choice": "current"}
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        resolved = resp.json()["cues"][0]
+        self.assertEqual(resolved["text"], "one")
+        self.assertEqual(resolved["start"], 1)
+
+    def test_multiple_field_conflicts_on_same_cue(self):
+        body = {
+            "base": [cue("a", 0, 10, "keep")],
+            "current": [cue("a", 8, 9, "cur")],
+            "incoming": [cue("a", 1, 3, "inc")],
+            "field_choices": [
+                {"cue_id": "a", "field": "start", "choice": "incoming"},
+                {"cue_id": "a", "field": "end", "choice": "current"},
+                {"cue_id": "a", "field": "text", "choice": "base"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cue_out = resp.json()["cues"][0]
+        self.assertEqual((cue_out["start"], cue_out["end"], cue_out["text"]), (1, 9, "keep"))
+
+    def test_missing_field_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [cue("a", 0, 2, "one")],
+            "incoming": [cue("a", 0, 2, "two")],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        errors = resp.json()["errors"]
+        self.assertTrue(any(e["type"] == "missing" for e in errors))
+
+    def test_missing_multiple_field_choices_all_reported(self):
+        body = {
+            "base": [cue("a", 0, 10, "keep")],
+            "current": [cue("a", 8, 9, "cur")],
+            "incoming": [cue("a", 1, 3, "inc")],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        missing = {e["field"] for e in resp.json()["errors"] if e["type"] == "missing"}
+        self.assertEqual(missing, {"start", "end", "text"})
+
+    def test_unknown_field_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [cue("a", 0, 2, "one")],
+            "incoming": [cue("a", 0, 2, "two")],
+            "field_choices": [
+                {"cue_id": "a", "field": "text", "choice": "current"},
+                {"cue_id": "a", "field": "start", "choice": "current"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        errors = resp.json()["errors"]
+        unknown = [e for e in errors if e["type"] == "unknown"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0]["field"], "start")
+
+    def test_unknown_cue_id_in_field_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2)],
+            "current": [cue("a", 0, 2)],
+            "incoming": [cue("a", 0, 2)],
+            "field_choices": [
+                {"cue_id": "ghost", "field": "text", "choice": "base"}
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["errors"][0]["type"], "unknown")
+
+    def test_duplicate_field_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [cue("a", 0, 2, "one")],
+            "incoming": [cue("a", 0, 2, "two")],
+            "field_choices": [
+                {"cue_id": "a", "field": "text", "choice": "current"},
+                {"cue_id": "a", "field": "text", "choice": "incoming"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        types = [e["type"] for e in resp.json()["errors"]]
+        self.assertEqual(types, ["duplicate"])
+
+    def test_field_choice_on_cue_conflict_is_type_mismatch(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+            "field_choices": [
+                {"cue_id": "a", "field": "text", "choice": "incoming"}
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        errors = resp.json()["errors"]
+        self.assertTrue(any(e["type"] == "type_mismatch" for e in errors))
+        self.assertTrue(any(e["type"] == "missing" and e["field"] is None for e in errors))
+
+    # —— cue 级冲突 ——
+
+    def test_delete_modify_pick_incoming(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+            "cue_choices": [{"cue_id": "a", "choice": "incoming"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual(len(cues), 1)
+        self.assertEqual(cues[0]["text"], "two")
+
+    def test_delete_modify_pick_deleted_side_deletes(self):
+        # current 已删除，选择 current 等同删除
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+            "cue_choices": [{"cue_id": "a", "choice": "current"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["count"], 0)
+
+    def test_delete_modify_choice_delete(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+            "cue_choices": [{"cue_id": "a", "choice": "delete"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["count"], 0)
+
+    def test_add_add_pick_each_side(self):
+        for choice, expected in [("current", "new"), ("incoming", "brand")]:
+            with self.subTest(choice=choice):
+                body = {
+                    "base": [],
+                    "current": [cue("n", 5, 7, "new")],
+                    "incoming": [cue("n", 5, 7, "brand")],
+                    "cue_choices": [{"cue_id": "n", "choice": choice}],
+                }
+                resp = client.post("/resolve", json=body)
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertEqual(resp.json()["cues"][0]["text"], expected)
+
+    def test_invalid_interval_cue_conflict_pick_side(self):
+        # current 只改起点、incoming 只改终点，自动合并为 [8,3] 非法
+        body = {
+            "base": [cue("a", 0, 10)],
+            "current": [cue("a", 8, 10)],
+            "incoming": [cue("a", 0, 3)],
+        }
+        conflict = client.post("/merge", json=body).json()
+        self.assertEqual(conflict["cue_conflicts"][0]["type"], "invalid_interval")
+
+        resolved_body = dict(body)
+        resolved_body["cue_choices"] = [{"cue_id": "a", "choice": "current"}]
+        resp = client.post("/resolve", json=resolved_body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertEqual((out["start"], out["end"]), (8, 10))
+
+    def test_missing_cue_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        errors = resp.json()["errors"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["type"], "missing")
+        self.assertEqual(errors[0]["cue_id"], "a")
+
+    def test_unknown_cue_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2)],
+            "current": [cue("a", 0, 2)],
+            "incoming": [cue("a", 0, 2)],
+            "cue_choices": [{"cue_id": "ghost", "choice": "incoming"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["errors"][0]["type"], "unknown")
+
+    def test_duplicate_cue_choice_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+            "cue_choices": [
+                {"cue_id": "a", "choice": "delete"},
+                {"cue_id": "a", "choice": "incoming"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual([e["type"] for e in resp.json()["errors"]], ["duplicate"])
+
+    def test_cue_choice_on_field_conflict_is_type_mismatch(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [cue("a", 0, 2, "one")],
+            "incoming": [cue("a", 0, 2, "two")],
+            "cue_choices": [{"cue_id": "a", "choice": "delete"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+        errors = resp.json()["errors"]
+        self.assertTrue(any(e["type"] == "type_mismatch" and e["field"] is None for e in errors))
+
+    def test_invalid_choice_value_is_422(self):
+        body = {
+            "base": [cue("a", 0, 2, "hi")],
+            "current": [],
+            "incoming": [cue("a", 0, 2, "two")],
+            "cue_choices": [{"cue_id": "a", "choice": "base"}],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 422)
+
+    # —— 应用决策后的统一校验（409，不输出部分结果）——
+
+    def test_field_decisions_producing_invalid_interval_409(self):
+        body = {
+            "base": [cue("a", 0, 10, "keep")],
+            "current": [cue("a", 8, 9, "cur")],
+            "incoming": [cue("a", 1, 3, "inc")],
+            "field_choices": [
+                {"cue_id": "a", "field": "start", "choice": "current"},
+                {"cue_id": "a", "field": "end", "choice": "incoming"},
+                {"cue_id": "a", "field": "text", "choice": "base"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "timeline_error")
+        self.assertEqual(data["invalid_intervals"], ["a"])
+        self.assertEqual(data["overlaps"], [])
+        self.assertNotIn("cues", data)
+
+    def test_field_decisions_producing_overlap_409(self):
+        # a、b 各自字段冲突；选 incoming 侧时间后 a=[1,4]、b=[3,12] 重叠
+        body = {
+            "base": [cue("a", 0, 10, "x"), cue("b", 10, 12, "y")],
+            "current": [cue("a", 8, 9, "cx"), cue("b", 9, 12, "cy")],
+            "incoming": [cue("a", 1, 4, "ix"), cue("b", 3, 12, "iy")],
+            "field_choices": [
+                {"cue_id": "a", "field": "start", "choice": "incoming"},
+                {"cue_id": "a", "field": "end", "choice": "incoming"},
+                {"cue_id": "a", "field": "text", "choice": "incoming"},
+                {"cue_id": "b", "field": "start", "choice": "incoming"},
+                {"cue_id": "b", "field": "text", "choice": "incoming"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "timeline_error")
+        self.assertEqual(data["invalid_intervals"], [])
+        self.assertEqual(len(data["overlaps"]), 1)
+        self.assertEqual(data["overlaps"][0]["cue_ids"], ["a", "b"])
+
+    def test_touching_intervals_after_decisions_resolve(self):
+        # 同样的冲突，选 current 侧：a=[8,9]、b=[9,12]，首尾相接合法
+        body = {
+            "base": [cue("a", 0, 10, "x"), cue("b", 10, 12, "y")],
+            "current": [cue("a", 8, 9, "cx"), cue("b", 9, 12, "cy")],
+            "incoming": [cue("a", 1, 4, "ix"), cue("b", 3, 12, "iy")],
+            "field_choices": [
+                {"cue_id": "a", "field": "start", "choice": "current"},
+                {"cue_id": "a", "field": "end", "choice": "current"},
+                {"cue_id": "a", "field": "text", "choice": "current"},
+                {"cue_id": "b", "field": "start", "choice": "current"},
+                {"cue_id": "b", "field": "text", "choice": "current"},
+            ],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        ids = [c["id"] for c in resp.json()["cues"]]
+        self.assertEqual(ids, ["a", "b"])
+
+    def test_no_conflict_but_overlap_still_409(self):
+        body = {
+            "base": [],
+            "current": [cue("a", 0, 5, "first")],
+            "incoming": [cue("b", 3, 8, "second")],
+        }
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "timeline_error")
+        self.assertEqual(len(data["overlaps"]), 1)
+
+    def test_resolved_timeline_is_sorted_by_time(self):
+        # cue 级冲突与干净合并同时存在，结果统一按时间排序
+        body = {
+            "base": [
+                cue("a", 0, 2, "hi"),
+                cue("d", 20, 21, "keep"),
+            ],
+            "current": [cue("d", 20, 21, "keep")],
+            "incoming": [
+                cue("a", 0, 2, "two"),
+                cue("d", 20, 21, "keep"),
+                cue("c", 10, 11, "late"),
+            ],
+            "cue_choices": [{"cue_id": "a", "choice": "incoming"}],
+        }
+        # 再让 current 单独新增一条更早的 cue
+        body["current"].append(cue("b", 5, 6, "mid"))
+        resp = client.post("/resolve", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        ids = [c["id"] for c in resp.json()["cues"]]
+        self.assertEqual(ids, ["a", "b", "c", "d"])
+
+
 if __name__ == "__main__":
     unittest.main()

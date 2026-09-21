@@ -113,6 +113,87 @@ class MergeSuccessResponse(BaseModel):
     count: int
 
 
+class FieldChoice(BaseModel):
+    """字段级冲突的人工决策：为 (cue_id, field) 选择一侧取值。"""
+
+    cue_id: str = Field(..., min_length=1, description="存在字段级冲突的 cue id")
+    field: Literal["start", "end", "text", "speaker"] = Field(
+        ..., description="存在冲突的字段"
+    )
+    choice: Literal["base", "current", "incoming"] = Field(
+        ..., description="采纳哪一侧的值"
+    )
+
+
+class CueChoice(BaseModel):
+    """cue 级冲突的人工决策：整条 cue 保留某一侧或删除。"""
+
+    cue_id: str = Field(..., min_length=1, description="存在 cue 级冲突的 cue id")
+    choice: Literal["current", "incoming", "delete"] = Field(
+        ...,
+        description=(
+            "current/incoming：整条 cue 采用该侧版本（若该侧已删除则等同于删除）；"
+            "delete：不输出该 cue"
+        ),
+    )
+
+
+class ResolveRequest(MergeRequest):
+    """POST /resolve 的请求体：在三方合并之上携带人工决策。"""
+
+    field_choices: list[FieldChoice] = Field(
+        default_factory=list, description="字段级冲突决策（按 cue_id + field 定位）"
+    )
+    cue_choices: list[CueChoice] = Field(
+        default_factory=list, description="cue 级冲突决策（按 cue_id 定位）"
+    )
+
+
+class DecisionError(BaseModel):
+    """单条无法接受的决策说明（422）。"""
+
+    cue_id: str
+    field: Optional[Literal["start", "end", "text", "speaker"]] = Field(
+        None, description="字段决策时的字段；cue 决策为 null"
+    )
+    type: Literal["duplicate", "unknown", "type_mismatch", "missing"] = Field(
+        ...,
+        description=(
+            "duplicate：同一目标存在多条决策；"
+            "unknown：决策针对的冲突不存在；"
+            "type_mismatch：决策类型与冲突层级不符（字段/cue 混用）；"
+            "missing：某个冲突没有给出决策"
+        ),
+    )
+    message: str
+
+
+class ResolveDecisionErrorResponse(BaseModel):
+    """决策无效时的 422 响应：不应用任何决策、不输出部分结果。"""
+
+    status: Literal["decision_error"] = "decision_error"
+    errors: list[DecisionError]
+
+
+class ResolveTimelineErrorResponse(BaseModel):
+    """应用决策后统一校验未通过的 409 响应：不输出部分结果。"""
+
+    status: Literal["timeline_error"] = "timeline_error"
+    invalid_intervals: list[str] = Field(
+        default_factory=list,
+        description="应用决策后 end <= start 的 cue id 列表",
+    )
+    overlaps: list[Overlap] = Field(default_factory=list, description="时间轴重叠区间")
+
+
+class ResolveSuccessResponse(BaseModel):
+    """冲突全部解决且时间轴合法：结果已按开始时间排序。"""
+
+    status: Literal["resolved"] = "resolved"
+    cues: list[Cue]
+    count: int
+
+
 class HealthResponse(BaseModel):
     """健康检查响应。"""
 
