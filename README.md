@@ -4,6 +4,10 @@
 `base`（共同祖先）、`current`（我方修订）、`incoming`（对方修订）——
 按 cue id 执行三方合并，检测字段级冲突、删除/修改冲突与时间轴重叠。
 
+- `POST /merge`：自动三方合并；存在冲突或重叠时只报告，不输出结果。
+- `POST /resolve`：复用同一套三方合并识别冲突，由调用方携带人工决策
+  （`field_choices` / `cue_choices`）解决全部冲突，再统一校验并返回 resolved 时间轴。
+
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
 ## 一条命令启动
@@ -109,6 +113,101 @@ Cue 结构（时间单位为秒，支持小数）：
 
 - `422`：请求体校验失败（重复 id、`end <= start` 等）。
 
+### POST /resolve
+
+在 `/merge` 的三方合并之上，通过人工决策解决全部冲突。请求体沿用 `base` /
+`current` / `incoming`，并增加两组决策：
+
+| 字段            | 类型           | 说明                                                                              |
+| --------------- | -------------- | --------------------------------------------------------------------------------- |
+| `base`          | Cue[]          | 共同祖先版本                                                                      |
+| `current`       | Cue[]          | 当前方修订                                                                        |
+| `incoming`      | Cue[]          | 外部方修订                                                                        |
+| `field_choices` | FieldChoice[]  | 字段级冲突决策，按 `cue_id` + `field` 定位                                        |
+| `cue_choices`   | CueChoice[]    | cue 级冲突决策（delete_modify / add_add / invalid_interval），按 `cue_id` 定位 |
+
+```json
+{
+  "field_choices": [
+    {"cue_id": "cue-01", "field": "text", "choice": "current"}
+  ],
+  "cue_choices": [
+    {"cue_id": "cue-02", "choice": "incoming"}
+  ]
+}
+```
+
+- `FieldChoice.choice`：`base` / `current` / `incoming`，该字段采纳对应侧取值；
+  未发生冲突的字段仍按自动合并规则处理，无需也不能在 `field_choices` 中给出。
+- `CueChoice.choice`：`current` / `incoming` / `delete`——整条采纳对应侧版本
+  （某侧本就是删除时等同于删除该 cue），或直接删除。
+
+#### 决策校验（422）
+
+决策必须**恰好覆盖**三方合并识别出的全部冲突，以下情况返回 `422`，
+`detail` 为逐项错误列表（含 `type` / `cue_id` / `field` / `message`）：
+
+| `type`          | 含义                                                           |
+| --------------- | -------------------------------------------------------------- |
+| `duplicate`     | 同一冲突点（`cue_id`+`field`，或 cue 级 `cue_id`）被重复决策 |
+| `unknown`       | 决策指向不存在冲突的 `cue_id`（或 `cue_id`+`field`）         |
+| `type_mismatch` | 字段冲突放进了 `cue_choices`，或 cue 级冲突放进了 `field_choices` |
+| `missing`       | 存在冲突却未给出对应决策                                       |
+
+**无冲突时只允许空决策**（`field_choices` 与 `cue_choices` 均为空或缺省），
+接口直接返回自动合并结果；任何非空决策都会按 `unknown` 拒绝。
+
+#### 统一时间轴校验（409）
+
+全部决策先通过上述校验，然后一次性应用，并对最终时间轴统一执行 Cue 校验：
+
+- 决策组合出 `end <= start` 的非法区间；
+- 存在区间重叠（严格相交，重叠时长 > 0；仅首尾相接不算重叠）。
+
+任一情况返回 `409 status=invalid_timeline`，列出 `invalid_intervals`（cue id）
+与 `overlaps`，**不输出任何部分结果**：
+
+```json
+{
+  "status": "invalid_timeline",
+  "invalid_intervals": ["a"],
+  "overlaps": [
+    { "cue_ids": ["a", "b"], "start": 4.0, "end": 4.5, "overlap": 0.5 }
+  ]
+}
+```
+
+#### 成功响应（200）
+
+校验通过后，resolved 时间轴按 `start` 升序排序（平局依次按 `end`、`id`）：
+
+```json
+{
+  "status": "resolved",
+  "cues": [ { "id": "a", "start": 1.0, "end": 3.0, "text": "hello!", "speaker": null } ],
+  "count": 1
+}
+```
+
+#### 快速试用 /resolve
+
+```bash
+curl -X POST http://localhost:8000/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":    [{"id":"a","start":0,"end":10,"text":"hi"}],
+    "current": [{"id":"a","start":1,"end":3,"text":"hello"}],
+    "incoming":[{"id":"a","start":7,"end":9,"text":"hola"}],
+    "field_choices": [
+      {"cue_id":"a","field":"start","choice":"current"},
+      {"cue_id":"a","field":"end","choice":"current"},
+      {"cue_id":"a","field":"text","choice":"incoming"}
+    ],
+    "cue_choices": []
+  }'
+# → {"status":"resolved","cues":[{"id":"a","start":1.0,"end":3.0,"text":"hola",...}],"count":1}
+```
+
 ## 快速试用
 
 ```bash
@@ -133,11 +232,11 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/）
-│   ├── merge.py      # 三方合并与重叠检测纯逻辑
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/）
+│   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 18 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 端到端用例（unittest + TestClient，覆盖 /merge 与 /resolve）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
